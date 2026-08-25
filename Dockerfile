@@ -32,6 +32,8 @@ COPY converter.py /app/converter.py
 COPY check.py /app/check.py
 COPY entrypoint.sh /app/entrypoint.sh
 
+ENV PYTHONUNBUFFERED=1
+
 RUN chmod +x /app/entrypoint.sh
 
 CMD ["/app/entrypoint.sh"]
