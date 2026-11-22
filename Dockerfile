@@ -1,39 +1,38 @@
-FROM alpine:latest
+# Pinned to a release branch so rebuilds are reproducible; bump deliberately.
+ARG ALPINE_VERSION=3.24
+FROM alpine:${ALPINE_VERSION}
 
 # We pass this variable from GitHub Actions. Default is 'cpu'.
+# Values: cpu, intel, amd, latest (= intel + amd drivers)
 ARG HW_TYPE=cpu
 
-# 1. Install Base Dependencies (Every hardware type gets these)
-RUN apk update && apk add --no-cache \
-    python3 \
-    ffmpeg \
-    libavif-apps \
-    libheif-tools \
-    exiftool \
-    bash
+# Base dependencies plus hardware-specific drivers in a single layer.
+# (--no-cache already fetches a fresh index, so no separate `apk update`.)
+RUN set -eux; \
+    case "$HW_TYPE" in \
+        cpu)    HW_PKGS="" ;; \
+        intel)  HW_PKGS="intel-media-driver libva-intel-driver libva-utils" ;; \
+        amd)    HW_PKGS="mesa-va-gallium libva-utils" ;; \
+        latest) HW_PKGS="intel-media-driver libva-intel-driver mesa-va-gallium libva-utils" ;; \
+        *)      echo "Unknown HW_TYPE '$HW_TYPE' (use cpu, intel, amd or latest)" >&2; exit 1 ;; \
+    esac; \
+    apk add --no-cache \
+        python3 \
+        ffmpeg \
+        libavif-apps \
+        libheif-tools \
+        exiftool \
+        $HW_PKGS; \
+    ln -sf /usr/bin/python3 /usr/bin/python; \
+    mkdir -p /data/input /data/output /app
 
-# 2. Install Hardware-Specific Drivers
-RUN if [ "$HW_TYPE" = "intel" ]; then \
-        apk add --no-cache intel-media-driver libva-intel-driver libva-utils; \
-    elif [ "$HW_TYPE" = "amd" ]; then \
-        apk add --no-cache mesa-va-gallium libva-utils; \
-    elif [ "$HW_TYPE" = "latest" ]; then \
-        # 'latest' installs everything for universal hardware support
-        apk add --no-cache intel-media-driver libva-intel-driver mesa-va-gallium libva-utils; \
-    fi
-
-# 3. Setup Python and Directories
-RUN ln -sf /usr/bin/python3 /usr/bin/python
-RUN mkdir -p /data/input /data/output /app
 WORKDIR /app
 
-# 4. Copy Scripts
-COPY converter.py /app/converter.py
-COPY check.py /app/check.py
-COPY entrypoint.sh /app/entrypoint.sh
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1
 
-ENV PYTHONUNBUFFERED=1
-
-RUN chmod +x /app/entrypoint.sh
+# Scripts last, so code changes don't invalidate the package layer.
+COPY --chmod=755 entrypoint.sh /app/entrypoint.sh
+COPY --chmod=644 common.py converter.py check.py /app/
 
 CMD ["/app/entrypoint.sh"]

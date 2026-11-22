@@ -16,7 +16,8 @@ This solution is perfect for optimizing large media archives without losing hist
     * **Structural Check:** Uses `ffprobe` to ensure files are not corrupt.
     * **Metadata Mismatch Check:** Verifies key metadata tags match the source file.
     * **Auto-Deletion:** Corrupted or invalid files are immediately deleted from the output to maintain archive quality.
-* **Smart "Revert" Logic:** If a converted image is larger than its original counterpart, the pipeline deletes the larger file and just copies the original, unless the original was already in a modern format.
+* **Smart "Revert" Logic:** If a converted file is larger than its original (see `LIMIT_SIZE`), the pipeline discards the conversion and copies the original instead, keeping its original extension (e.g. `photo.png` stays `photo.png`). Files already in a modern format (HEIC/AVIF) are never reverted.
+* **Safe to Interrupt:** Files are written to a hidden temporary name and only moved into place when complete. `docker stop` / Ctrl+C stops the running encoders cleanly, and a re-run picks up where it left off.
 
 ---
 
@@ -51,7 +52,7 @@ services:
       - VIDEO_CODEC=hevc           # Set default video codec (hevc or av1)
       - VIDEO_QUALITY=28          # Integer quality level (lower is better, default 28)
       - IMAGE_FORMAT=heic         # Set default image format (heic or avif)
-      - IMAGE_QUALITY=70          # Integer image quality (0-100, default 70)
+      - IMAGE_QUALITY=70          # Integer image quality (0-100, default 60)
     # The pipeline runs once and then exits. Set a restart policy if you want it to trigger again on changes.
     # restart: unless-stopped
 ```
@@ -71,10 +72,53 @@ You can customize the conversion process by setting the following environment va
 | **`VIDEO_PRESET`** | `slow`, `medium`, `fast`, `0`-`13` | *Auto* | Encoding speed/efficiency. Defaults to **`medium`** (HEVC) or **`6`** (AV1) if not specified. |
 | **`VIDEO_CONTAINER`** | `mp4`, `mkv`, etc. | `mp4` | The file extension for all output videos. |
 | **`IMAGE_FORMAT`** | `heic`, `avif` | `heic` | Defines the modern format for image files. |
-| **`IMAGE_QUALITY`** | Integer `0` - `100` | **`70`** | Sets the target quality for image encoding. |
+| **`IMAGE_QUALITY`** | Integer `0` - `100` | **`60`** | Sets the target quality for image encoding. |
 | **`IMAGE_SPEED`** | Integer `0` - `9` | `4` | Controls the encoding speed for AVIF files (`avifenc`). |
 | **`CHECKS`** | `all`, `integrity`, `metadata`, `none` | `all` | Controls which validation steps run after conversion. |
 | **`FORCE_OVERWRITE`** | `true`, `false` | `false` | If `true`, re-processes and overwrites files already present in the output directory. |
 | **`LIMIT_SIZE`** | `always`, `videos`, `images`, `never` | `always` | If the converted file is larger than the original, it reverts and keeps the original file. |
+| **`MODE`** | `full`, `convert`, `check` | `full` | Run conversion and check (`full`), only the conversion, or only the integrity check. |
+| **`JOBS`** | Integer | `4` | Number of files converted at the same time. |
+| **`THREADS`** | Integer | `2` | CPU threads per encoder (`0` = let the encoder decide). |
+| **`CHECK_THREADS`** | Integer | CPU cores + 4 (max 32) | Number of files verified at the same time. |
+| **`DATE_TOLERANCE_SECONDS`** | Integer | `86400` | Allowed difference between source and output dates (timezone drift). |
+| **`DURATION_TOLERANCE_SECONDS`** | Number | `5` | Allowed difference in video duration before a file counts as truncated. |
 | **`INPUT_DIR`** | Path | `/data/input` | The directory containing your source files. |
 | **`OUTPUT_DIR`** | Path | `/data/output` | The directory where processed files are stored. |
+
+Invalid values (e.g. `IMAGE_FORMAT=jpg` or `JOBS=abc`) stop the container with a clear `[FATAL]` message instead of producing wrongly named files.
+
+---
+
+### **Output Naming**
+
+The output mirrors the input folder structure and keeps the file name, with the new extension: `Holiday/IMG_0001.jpg` becomes `Holiday/IMG_0001.heic`, and `Holiday/IMG_0001.mov` becomes `Holiday/IMG_0001.mp4`.
+
+If two files in the same folder would end up with the same name (e.g. `IMG_0001.jpg` and `IMG_0001.png`), the first one alphabetically keeps the normal name and the other keeps its source extension in the name: `IMG_0001.png.heic`. A `[WARN] Name clash` line is printed for each such file.
+
+Synology `@eaDir` thumbnail folders, macOS `._*` resource-fork files and recycle-bin folders are ignored.
+
+---
+
+### **Running as a Non-Root User**
+
+By default the container runs as root, so output files are owned by root on the host. To get files owned by your own user, set `user:` and give that user access to the GPU through the `video`/`render` groups (look up their IDs on the host with `getent group video render`):
+
+```yaml
+services:
+  media-pipeline:
+    image: ghcr.io/blhackslash/media-converter:latest
+    user: "1000:1000"          # your UID:GID (see `id`)
+    group_add:
+      - "44"                   # video group ID on the host
+      - "104"                  # render group ID on the host
+    devices:
+      - /dev/dri:/dev/dri
+    volumes:
+      - /path/to/source:/data/input:ro
+      - /path/to/output:/data/output
+```
+
+The input folder can be mounted read-only (`:ro`); the pipeline never writes to it.
+
+If `HW_ACCEL=true` but the render device is not available in the container, the pipeline prints a warning and falls back to CPU encoding instead of failing every video.
