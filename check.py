@@ -1,24 +1,24 @@
 import os
-import subprocess
+import sys
 import json
 import re
+import shutil
 import concurrent.futures
-from pathlib import Path
 from datetime import datetime
 
-# --- Configuration ---
-INPUT_DIR = Path(os.environ.get("INPUT_DIR", "/data/input"))
-OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "/data/output"))
-CHECKS = os.environ.get("CHECKS", "all").lower() 
+from common import (
+    INPUT_DIR, OUTPUT_DIR, MODE, STOP, Plan, env_choice, env_float, env_int,
+    is_partial, remove_quietly, scan_inputs, walk_files,
+)
 
-# Added Variables for Robustness & Parallelization
-MODE = os.environ.get("MODE", "full").lower() # convert, check, full
-DATE_TOLERANCE_SECONDS = int(os.environ.get("DATE_TOLERANCE_SECONDS", 86400)) # Default 24h for timezone drift
-DURATION_TOLERANCE_SECONDS = float(os.environ.get("DURATION_TOLERANCE_SECONDS", 5.0)) # 5 second leniency
+# --- Configuration ---
+CHECKS = env_choice("CHECKS", "all", {"all", "integrity", "metadata", "none"})
+DATE_TOLERANCE_SECONDS = env_int("DATE_TOLERANCE_SECONDS", 86400, minimum=0)  # Default 24h for timezone drift
+DURATION_TOLERANCE_SECONDS = env_float("DURATION_TOLERANCE_SECONDS", 5.0)  # 5 second leniency
 
 # Dynamic Threading: Defaults to (CPU cores + 4) up to 32 if not specified
 DEFAULT_WORKERS = min(32, (os.cpu_count() or 1) + 4)
-CHECK_THREADS = int(os.environ.get("CHECK_THREADS", DEFAULT_WORKERS))
+CHECK_THREADS = env_int("CHECK_THREADS", DEFAULT_WORKERS, minimum=1)
 
 def check_structural_integrity(file_path):
     # Check 1: Is the file completely empty?
@@ -26,17 +26,22 @@ def check_structural_integrity(file_path):
         return False, "File is 0 bytes."
 
     # Check 2: FFprobe container scan
-    cmd = [
+    res = STOP.run([
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", str(file_path)
-    ]
-    try:
-        res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
-        if res.returncode == 0 and not res.stderr.strip():
+    ], capture_stdout=True)
+    stderr = res.stderr.decode("utf-8", errors="replace").strip()
+    if res.returncode == 0 and not stderr:
+        return True, ""
+
+    # Older ffmpeg builds cannot parse HEIC/AVIF containers at all. Before
+    # declaring such a file corrupt (and deleting it), ask libheif.
+    if file_path.suffix.lower() in (".heic", ".heif", ".avif") and shutil.which("heif-info"):
+        if STOP.run(["heif-info", str(file_path)]).returncode == 0:
             return True, ""
-        return False, res.stderr.strip().replace('\n', ' ')[:100]
-    except Exception as e:
-        return False, str(e)
+
+    return False, stderr.replace('\n', ' ')[:200] or f"ffprobe exited with code {res.returncode}"
+
 
 def extract_gps(meta):
     lat, lon = meta.get("GPSLatitude"), meta.get("GPSLongitude")
@@ -44,7 +49,7 @@ def extract_gps(meta):
     if lat is not None and lon is not None:
         try:
             return float(lat), float(lon)
-        except ValueError:
+        except (TypeError, ValueError):
             pass
 
     coords = meta.get("GPSCoordinates")
@@ -63,14 +68,15 @@ def get_metadata(file_path):
     cmd = ["exiftool", "-j", "-n", "-DateTimeOriginal", "-CreationDate", "-CreateDate",
            "-GPSLatitude", "-GPSLongitude", "-GPSCoordinates", "-Duration", "-ee", str(file_path)]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        res = STOP.run(cmd, capture_stdout=True)
         if res.returncode == 0:
-            data = json.loads(res.stdout)
-            if data and len(data) > 0:
+            data = json.loads(res.stdout.decode("utf-8", errors="replace"))
+            if data:
                 return data[0]
-        return {}
-    except Exception:
-        return {}
+    except (ValueError, OSError):
+        pass
+    return {}
+
 
 def parse_base_date(date_str):
     if not date_str: return None
@@ -130,120 +136,125 @@ def compare_metadata(meta_src, meta_dst):
         try:
             if abs(float(dur_src) - float(dur_dst)) > DURATION_TOLERANCE_SECONDS:
                 discrepancies.append("Duration Mismatch (File may be truncated)")
-        except ValueError:
+        except (TypeError, ValueError):
             pass
 
     if not discrepancies: return True, ""
     return False, " | ".join(discrepancies)
 
-def get_input_files():
-    input_files = {}
-    for root, dirs, files in os.walk(INPUT_DIR):
-        for f in files:
-            path = Path(root) / f
-            rel_dir = path.parent.relative_to(INPUT_DIR)
-            input_files[(str(rel_dir), path.stem)] = path
-    return input_files
-
 def check_single_file(out_path, in_path):
     """Worker function for checking a single file."""
+    name = str(out_path.relative_to(OUTPUT_DIR))
+    if STOP.stopped:
+        return {"status": "CANCELLED", "file": name, "msg": ""}
     if not in_path:
-        return {"status": "MISSING", "file": out_path.name, "msg": "No matching input file found."}
+        return {"status": "MISSING", "file": name, "msg": "No matching input file found."}
 
-    # 1. Structural Check
-    if CHECKS in ["all", "integrity"]:
-        is_struct_ok, struct_err = check_structural_integrity(out_path)
-        if not is_struct_ok:
-            try:
-                out_path.unlink()
-            except FileNotFoundError:
-                pass
-            return {"status": "FAIL", "file": out_path.name, "msg": f"CORRUPT FILE: {struct_err} -> Deleted corrupted file."}
+    try:
+        # 1. Structural Check
+        if CHECKS in ("all", "integrity"):
+            is_struct_ok, struct_err = check_structural_integrity(out_path)
+            if STOP.stopped:
+                return {"status": "CANCELLED", "file": name, "msg": ""}
+            if not is_struct_ok:
+                remove_quietly(out_path)
+                return {"status": "FAIL", "file": name, "msg": f"CORRUPT FILE: {struct_err} -> Deleted corrupted file."}
 
-    # 2. Metadata Check & Fix
-    if CHECKS in ["all", "metadata"]:
-        is_meta_ok, meta_err = compare_metadata(get_metadata(in_path), get_metadata(out_path))
-        if not is_meta_ok:
-            msg_prefix = f"METADATA ERROR: {meta_err}. Attempting fix..."
-            
-            # Try to re-apply the EXIF fix directly over the file
-            subprocess.run([
-                "exiftool", "-tagsFromFile", str(in_path),
-                "-all:all",                                
-                "-Orientation<Rotation",                  
-                "-Orientation<Orientation",                
-                "-overwrite_original", str(out_path)
-            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        # 2. Metadata Check & Fix
+        if CHECKS in ("all", "metadata"):
+            is_meta_ok, meta_err = compare_metadata(get_metadata(in_path), get_metadata(out_path))
+            if STOP.stopped:
+                return {"status": "CANCELLED", "file": name, "msg": ""}
+            if not is_meta_ok:
+                msg_prefix = f"METADATA ERROR: {meta_err}. Attempting fix..."
 
-            # Re-verify after fix
-            is_meta_ok_retry, meta_err_retry = compare_metadata(get_metadata(in_path), get_metadata(out_path))
-            
-            if not is_meta_ok_retry:
-                try:
-                    out_path.unlink()
-                except FileNotFoundError:
-                    pass
-                return {"status": "FAIL", "file": out_path.name, "msg": f"{msg_prefix} FIX FAILED: {meta_err_retry} -> Deleted file."}
-            else:
-                return {"status": "WARN", "file": out_path.name, "msg": f"{msg_prefix} Metadata restored successfully!"}
+                # Try to re-apply the EXIF fix directly over the file
+                STOP.run([
+                    "exiftool", "-q", "-q", "-tagsFromFile", str(in_path),
+                    "-all:all",
+                    "-Orientation<Rotation",
+                    "-Orientation<Orientation",
+                    "-overwrite_original", str(out_path)
+                ])
 
-    return {"status": "OK", "file": out_path.name, "msg": "Verified"}
+                # Re-verify after fix
+                is_meta_ok_retry, meta_err_retry = compare_metadata(get_metadata(in_path), get_metadata(out_path))
+                if STOP.stopped:
+                    return {"status": "CANCELLED", "file": name, "msg": ""}
+
+                if not is_meta_ok_retry:
+                    remove_quietly(out_path)
+                    return {"status": "FAIL", "file": name, "msg": f"{msg_prefix} FIX FAILED: {meta_err_retry} -> Deleted file."}
+                return {"status": "WARN", "file": name, "msg": f"{msg_prefix} Metadata restored successfully!"}
+
+        return {"status": "OK", "file": name, "msg": "Verified"}
+    except Exception as e:
+        # Never delete on an unexpected error, just report it.
+        return {"status": "ERROR", "file": name, "msg": str(e)}
+
 
 def main():
     if MODE == "convert":
         print("--- Integrity Check Skipped (MODE=convert) ---")
-        return
+        return 0
 
     print("--- Starting Integrity Check ---")
 
     if CHECKS == "none":
         print("Checks disabled by environment variable (CHECKS=none). Exiting gracefully.")
-        return
+        return 0
 
-    if not OUTPUT_DIR.exists() or not INPUT_DIR.exists():
-        print("[ERROR] Input or Output directory missing.")
-        return
+    if not OUTPUT_DIR.is_dir() or not INPUT_DIR.is_dir():
+        print(f"[ERROR] Input ({INPUT_DIR}) or output ({OUTPUT_DIR}) directory missing.")
+        return 1
 
-    input_map = get_input_files()
-    output_files = [Path(root) / f for root, dirs, files in os.walk(OUTPUT_DIR) for f in files]
+    STOP.install()
+
+    # Use the same planning as the converter, so every output is compared with
+    # the file it was actually made from (e.g. IMG_1.heic with IMG_1.jpg, not
+    # with the IMG_1.mov of the same Live Photo).
+    plan = Plan(scan_inputs())
+    output_files = [p for p in walk_files(OUTPUT_DIR) if not is_partial(p.name)]
     total_files = len(output_files)
 
     print(f"Found {total_files} files in output directory to verify ({CHECK_THREADS} Concurrent Threads)...\n")
-    passed = 0; failed = 0; count = 0
+    passed = 0; failed = 0; errors = 0; count = 0
 
-    # Execute checks using ThreadPoolExecutor for concurrent processing
     with concurrent.futures.ThreadPoolExecutor(max_workers=CHECK_THREADS) as executor:
-        # Prepare the file mappings
-        future_to_file = {}
-        for out_path in output_files:
-            rel_dir = str(out_path.parent.relative_to(OUTPUT_DIR))
-            in_path = input_map.get((rel_dir, out_path.stem))
-            future_to_file[executor.submit(check_single_file, out_path, in_path)] = out_path
+        futures = [executor.submit(check_single_file, out_path, plan.by_output.get(out_path))
+                   for out_path in output_files]
 
-        # Process results as they complete
-        for future in concurrent.futures.as_completed(future_to_file):
+        for future in concurrent.futures.as_completed(futures):
             count += 1
             res = future.result()
-            
-            status = res["status"]
-            fname = res["file"]
-            msg = res["msg"]
+            status, fname, msg = res["status"], res["file"], res["msg"]
 
             if status == "OK":
                 print(f"[{count}/{total_files}] [OK] {fname} -> {msg}")
                 passed += 1
             elif status == "WARN":
                 print(f"[{count}/{total_files}] [WARN] {fname} -> {msg}")
-                passed += 1 # It was fixed, so we consider it passed
+                passed += 1  # It was fixed, so we consider it passed
             elif status == "MISSING":
                 print(f"[{count}/{total_files}] [WARN] {fname} -> {msg}")
             elif status == "FAIL":
                 print(f"[{count}/{total_files}] [FAIL] {fname} -> {msg}")
                 failed += 1
+            elif status == "ERROR":
+                print(f"[{count}/{total_files}] [ERROR] {fname} -> {msg}")
+                errors += 1
+
+    if STOP.stopped:
+        print("\n--- Integrity Check Stopped ---")
+        return STOP.exit_code()
 
     print("\n--- Integrity Check Complete ---")
     print(f"Total Verified: {passed}")
     print(f"Total Deleted:  {failed}")
+    if errors:
+        print(f"Total Errors:   {errors} (files kept, see ERROR lines above)")
+    return 0
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

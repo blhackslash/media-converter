@@ -1,0 +1,5 @@
+*
+!entrypoint.sh
+!common.py
+!converter.py
+!check.py
